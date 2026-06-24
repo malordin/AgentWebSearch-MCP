@@ -96,76 +96,88 @@ class SearchResult:
 #
 
 PORTAL_CONFIG = {
-    "naver": {
-        "search_url": "https://search.naver.com/search.naver?query=",  # Integrated search
-        "extract_script": """
-            const results = [];
-            document.querySelectorAll('#main_pack a[href^="http"]').forEach(a => {
-                const href = a.href;
-                const text = a.textContent ? a.textContent.trim() : '';
-                if (href &&
-                    href.indexOf('naver.com') === -1 &&
-                    href.indexOf('javascript') === -1 &&
-                    text && text.length > 15 && text.length < 200) {
-                    if (!results.find(r => r.url === href)) {
-                        results.push({
-                            title: text.substring(0, 80),
-                            url: href,
-                            snippet: ''
-                        });
-                    }
-                }
-            });
-            return results.slice(0, 10);
-        """
-    },
+    # "naver": {
+    #     "search_url": "https://search.naver.com/search.naver?query=",  # Integrated search
+    #     "extract_script": """
+    #         const results = [];
+    #         document.querySelectorAll('#main_pack a[href^="http"]').forEach(a => {
+    #             const href = a.href;
+    #             const text = a.textContent ? a.textContent.trim() : '';
+    #             if (href &&
+    #                 href.indexOf('naver.com') === -1 &&
+    #                 href.indexOf('javascript') === -1 &&
+    #                 text && text.length > 15 && text.length < 200) {
+    #                 if (!results.find(r => r.url === href)) {
+    #                     results.push({
+    #                         title: text.substring(0, 80),
+    #                         url: href,
+    #                         snippet: ''
+    #                     });
+    #                 }
+    #             }
+    #         });
+    #         return results.slice(0, 10);
+    #     """
+    # },
     "google": {
         "search_url": "https://www.google.com/search?q=",
-        "extract_script": """
-            const results = [];
-            document.querySelectorAll('#search .g, #rso .g, div[data-hveid]').forEach(el => {
-                const titleEl = el.querySelector('h3');
-                const linkEl = el.querySelector('a[href^="http"]');
-                const snippetEl = el.querySelector('[data-sncf], .VwiC3b');
-                if (titleEl && linkEl) {
-                    const url = linkEl.href;
-                    if (url.indexOf('google.com') === -1) {
-                        results.push({
-                            title: titleEl.textContent ? titleEl.textContent.trim() : '',
-                            url: url,
-                            snippet: snippetEl ? (snippetEl.textContent || '').substring(0, 150) : ''
-                        });
-                    }
-                }
-            });
-            return results.slice(0, 10);
-        """
-    },
-    "brave": {
-        "search_url": "https://search.brave.com/search?q=",
+        # NOTE: Google changes its DOM frequently. The reliable pattern is
+        # <a href="..."><h3>Title</h3></a> — the link directly wraps h3.
+        # Old approach (#search .g > a) no longer works (class .g removed).
         "extract_script": """
             const results = [];
             const seen = new Set();
-            document.querySelectorAll('a[href^="http"]').forEach(a => {
+            document.querySelectorAll('#search a, #rso a').forEach(a => {
+                const h3 = a.querySelector('h3');
+                if (!h3) return;
                 const href = a.href;
-                if (href &&
-                    href.indexOf('brave.com') === -1 &&
-                    href.indexOf('javascript') === -1 &&
-                    !seen.has(href)) {
-                    const text = a.textContent ? a.textContent.trim() : '';
-                    if (text && text.length > 10 && text.length < 150) {
-                        seen.add(href);
-                        results.push({
-                            title: text.substring(0, 80),
-                            url: href,
-                            snippet: ''
-                        });
+                if (!href || href.indexOf('google.') !== -1 ||
+                    href.indexOf('gstatic') !== -1 || seen.has(href)) return;
+                seen.add(href);
+                // Walk up to parent block to find snippet text
+                let snippet = '';
+                let context = a.closest('[data-ved]') || a.parentElement;
+                if (context) {
+                    let next = context.nextElementSibling;
+                    if (next) {
+                        let span = next.querySelector('span, div');
+                        snippet = span ? (span.textContent || '').substring(0, 150) : '';
                     }
                 }
+                results.push({
+                    title: h3.textContent ? h3.textContent.trim() : '',
+                    url: href,
+                    snippet: snippet
+                });
             });
             return results.slice(0, 10);
         """
-    }
+    },
+    # "brave": {
+    #     "search_url": "https://search.brave.com/search?q=",
+    #     "extract_script": """
+    #         const results = [];
+    #         const seen = new Set();
+    #         document.querySelectorAll('a[href^="http"]').forEach(a => {
+    #             const href = a.href;
+    #             if (href &&
+    #                 href.indexOf('brave.com') === -1 &&
+    #                 href.indexOf('javascript') === -1 &&
+    #                 !seen.has(href)) {
+    #                 const text = a.textContent ? a.textContent.trim() : '';
+    #                 if (text && text.length > 10 && text.length < 150) {
+    #                     seen.add(href);
+    #                     results.push({
+    #                         title: text.substring(0, 80),
+    #                         url: href,
+    #                         snippet: ''
+    #                     });
+    #                 }
+    #             }
+    #         });
+    #         return results.slice(0, 10);
+    #     """
+    # }
 }
 
 # Stealth script - bypass browser automation detection
@@ -222,47 +234,137 @@ CAPTCHA_DETECT_SCRIPT = """
 # ========== CDP Direct Communication ==========
 
 class CDPClient:
-    """CDP Direct Communication Client (Simplified)"""
+    """
+    CDP Direct Communication Client.
+
+    Tab isolation model:
+    - create_tab() opens a NEW browser tab with a unique page_id/ws_url.
+      Each search/fetch gets its own tab so concurrent operations don't
+      overwrite each other.
+    - close_tab() closes the tab when work is done.
+    - _reconnect() reattaches to OUR specific tab (after navigation
+      may have dropped the WebSocket), not to any random tab.
+    - connect(target_id) can optionally find a specific tab.
+    - Fallback: if create_tab fails (old Chrome / permission issue),
+      falls back to reusing an existing tab (legacy behaviour).
+    """
 
     def __init__(self, port: int):
         self.port = port
         self.base_url = f"http://localhost:{port}"
         self.ws_url: Optional[str] = None
         self.page_id: Optional[str] = None
+        self._owns_tab: bool = False  # did we create this tab?
 
-    def connect(self) -> bool:
-        """Connect to webpage tab (excluding extensions)"""
+    def connect(self, target_id: str = None) -> bool:
+        """
+        Connect to a tab.
+        If target_id is given, find that specific tab (used by _reconnect).
+        Otherwise find the first http/https page tab.
+        """
         try:
             resp = httpx.get(f"{self.base_url}/json/list", timeout=5)
             tabs = resp.json()
 
+            if target_id:
+                for tab in tabs:
+                    if (tab.get("id") == target_id and
+                            tab.get("type") == "page"):
+                        self.ws_url = tab.get("webSocketDebuggerUrl")
+                        self.page_id = tab.get("id")
+                        return True
+                return False
+
             # Find actual webpage tabs starting with http/https
             for tab in tabs:
                 url = tab.get("url", "")
-                if url.startswith("http://") or url.startswith("https://"):
+                if (url.startswith("http://") or url.startswith("https://")) \
+                        and tab.get("type") == "page":
                     self.ws_url = tab.get("webSocketDebuggerUrl")
                     self.page_id = tab.get("id")
                     return True
 
-            # If no webpage tab, use first tab
-            if tabs:
-                self.ws_url = tabs[0].get("webSocketDebuggerUrl")
-                self.page_id = tabs[0].get("id")
-                return True
+            # If no webpage tab, use first page-type tab
+            for tab in tabs:
+                if tab.get("type") == "page":
+                    self.ws_url = tab.get("webSocketDebuggerUrl")
+                    self.page_id = tab.get("id")
+                    return True
 
             return False
         except Exception as e:
             logger.error(f"[CDP:{self.port}] Connection failed: {e}")
             return False
 
-    def navigate(self, url: str, wait_time: float = 3.0) -> bool:
-        """Navigate to page (using CDP Protocol with stealth script injection)"""
+    def create_tab(self, url: str = "about:blank") -> bool:
+        """
+        Create a new isolated browser tab.
+        Returns True if a new tab was created, False if fell back to
+        an existing tab.
+        """
+        try:
+            resp = httpx.put(f"{self.base_url}/json/new", timeout=5)
+            tab = resp.json()
+            self.page_id = tab.get("id")
+            self.ws_url = tab.get("webSocketDebuggerUrl")
+            self._owns_tab = True
+            logger.debug(f"[CDP:{self.port}] Created tab {self.page_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"[CDP:{self.port}] create_tab failed ({e}), "
+                           f"falling back to existing tab")
+            self._owns_tab = False
+            return self.connect()
+
+    def close_tab(self):
+        """Close the tab if we own it."""
+        if self._owns_tab and self.page_id:
+            try:
+                httpx.get(f"{self.base_url}/json/close/{self.page_id}",
+                          timeout=3)
+                logger.debug(f"[CDP:{self.port}] Closed tab {self.page_id}")
+            except Exception:
+                pass
+        self.ws_url = None
+        self.page_id = None
+        self._owns_tab = False
+
+    def _reconnect(self):
+        """Reattach to our own tab after navigation (ws may have dropped)."""
+        if self.page_id:
+            self.ws_url = None
+            self.connect(target_id=self.page_id)
+        else:
+            self.ws_url = None
+            self.connect()
+
+    def navigate(self, url: str, wait_time: float = 3.0,
+                 max_extra_wait: float = 15.0,
+                 content_check: str = "") -> bool:
+        """
+        Navigate to page (using CDP Protocol with stealth script injection).
+
+        Waiting strategy:
+        1. Fixed wait_time initial sleep (lets page start loading)
+        2. Dynamic poll: wait for document.readyState === 'complete'
+        3. Challenge detection: if Cloudflare/Yandex SSO challenge page
+           is detected, keep waiting up to max_extra_wait until it resolves.
+        4. Content check: if content_check JS provided, also wait until
+           it returns truthy (ensures results rendered).
+
+        Args:
+            wait_time: initial fixed sleep before polling (seconds).
+            max_extra_wait: maximum additional wait time (seconds).
+            content_check: optional JS expression returning truthy when
+            page content is ready. E.g. a selector that exists only when
+            search results have rendered.
+        """
         try:
             import websocket
             import json as js
 
             if not self.ws_url:
-                self.connect()
+                self._reconnect()
 
             ws = websocket.create_connection(self.ws_url, timeout=10)
 
@@ -285,12 +387,14 @@ class CDPClient:
             resp = ws.recv()
             ws.close()
 
-            # Wait for page load
+            # Phase 1: initial fixed sleep
             time.sleep(wait_time)
 
-            # Reconnect (ws_url may change after navigate)
-            self.ws_url = None
-            self.connect()
+            # Reconnect to OUR tab (ws may have dropped after navigation)
+            self._reconnect()
+
+            # Phase 2: dynamic wait — poll readyState + challenge + content
+            self._wait_for_page_settle(max_extra_wait, content_check)
 
             return True
 
@@ -298,14 +402,62 @@ class CDPClient:
             logger.error(f"[CDP:{self.port}] Navigate failed: {e}")
             return False
 
+    def _wait_for_page_settle(self, max_wait: float = 15.0,
+                             content_check: str = ""):
+        """
+        Poll page until readyState is 'complete' AND any Cloudflare/Yandex
+        challenge has resolved. If content_check JS is provided, also wait
+        until that condition returns truthy (ensures results rendered, not
+        just that the DOM finished loading).
+
+        Args:
+            max_wait: maximum seconds to poll.
+            content_check: JS expression that returns truthy when page
+            content is ready (e.g. "document.querySelector('#search h3')").
+            None/empty disables content check (for fetch, not search).
+        """
+        deadline = time.time() + max_wait
+        poll_interval = 1.0  # seconds between polls
+
+        while time.time() < deadline:
+            title = self.evaluate("return document.title || '';") or ""
+            ready = self.evaluate("return document.readyState || '';") or ""
+            content_ready = True  # default: satisfied if no check given
+            if content_check:
+                content_ready = bool(
+                    self.evaluate(f"return !!({content_check});")
+                )
+            # Refresh ws before next poll (connection can drop)
+            self._reconnect()
+
+            # Cloudflare: "Один момент…" / "Just a moment…" / "Checking your browser"
+            # Yandex SSO: "Авторизация" / "Авторизация в Яндекс"
+            challenge_titles = [
+                "один момент", "just a moment", "checking your browser",
+                "cloudflare", "авторизац", "проверка безопасности",
+            ]
+            is_challenge = any(t in title.lower() for t in challenge_titles)
+
+            if ready == "complete" and not is_challenge and content_ready:
+                # Page loaded, not a challenge, content rendered — done
+                return
+
+            if is_challenge:
+                logger.info(f"[CDP:{self.port}] Challenge page detected "
+                            f"(title='{title}'), waiting for resolution...")
+            # else: page still loading or content not rendered, keep waiting
+
+            time.sleep(poll_interval)
+
     def evaluate(self, script: str) -> any:
-        """Execute JavaScript"""
+        """Execute JavaScript on OUR tab (never a random tab)."""
         try:
             import websocket
             import json as js
 
             if not self.ws_url:
-                self.connect()
+                # Reconnect to OUR specific tab, not any random one
+                self._reconnect()
 
             ws = websocket.create_connection(self.ws_url, timeout=10)
 
@@ -337,6 +489,42 @@ class CDPClient:
             return None
 
 
+# ========== Tab Cleanup ==========
+
+# Maximum number of page-type tabs allowed per Chrome instance.
+# If exceeded, oldest about:blank tabs are closed to prevent resource leak
+# from crashed/abandoned operations.
+MAX_OPEN_TABS = 15
+
+
+def _cleanup_stale_tabs(port: int):
+    """
+    Enforce tab count limit by closing excess tabs.
+
+    IMPORTANT: This only closes tabs when the count exceeds MAX_OPEN_TABS.
+    It does NOT close about:blank tabs indiscriminately — those are often
+    newly-created tabs owned by concurrent threads that haven't navigated
+    yet. Closing them causes race conditions where one search destroys
+    another's tab.
+    """
+    try:
+        resp = httpx.get(f"http://localhost:{port}/json/list", timeout=3)
+        tabs = resp.json()
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+
+        if len(page_tabs) > MAX_OPEN_TABS:
+            # Only close excess tabs, starting from the newest ones
+            # (keep the oldest MAX_OPEN_TABS, close the rest)
+            for tab in page_tabs[MAX_OPEN_TABS:]:
+                tab_id = tab.get("id")
+                if tab_id:
+                    httpx.get(
+                        f"http://localhost:{port}/json/close/{tab_id}",
+                        timeout=2)
+    except Exception:
+        pass  # Best-effort cleanup
+
+
 # ========== Search Functions ==========
 
 def _search_portal(portal: str, keyword: str) -> list[SearchResult]:
@@ -362,34 +550,55 @@ def _search_portal(portal: str, keyword: str) -> list[SearchResult]:
     try:
         start_time = time.time()
 
-        # CDP client
+        # CDP client — create a NEW isolated tab for this search
         client = CDPClient(port)
-        if not client.connect():
+        if not client.create_tab():
             return []
 
-        # Navigate to search URL
-        import urllib.parse
-        search_url = config["search_url"] + urllib.parse.quote(keyword)
-        client.navigate(search_url, wait_time=3.5)
+        try:
+            # Navigate to search URL
+            import urllib.parse
+            search_url = config["search_url"] + urllib.parse.quote(keyword)
 
-        # Extract results
-        raw_result = client.evaluate(config["extract_script"])
-        results = _parse_results(raw_result, portal)
+            # Content check: wait for search results to actually render.
+            # Google: wait for at least one h3 inside #search (results container).
+            content_check = ""
+            if portal == "google":
+                content_check = "document.querySelector('#search h3, #rso h3')"
+            client.navigate(search_url, wait_time=3.5,
+                            max_extra_wait=20.0,
+                            content_check=content_check)
 
-        elapsed = time.time() - start_time
+            # Extract results
+            raw_result = client.evaluate(config["extract_script"])
+            results = _parse_results(raw_result, portal)
 
-        # If 0 results, detect CAPTCHA
-        if len(results) == 0:
-            captcha_indicators = client.evaluate(CAPTCHA_DETECT_SCRIPT)
-            if captcha_indicators and len(captcha_indicators) > 0:
-                logger.warning(f"[{portal}] CAPTCHA detected: {captcha_indicators} - manual resolution required in browser")
-                print(f"\n[{portal.upper()}] CAPTCHA detected! Please solve it in browser (port {port}).", file=__import__('sys').stderr)
-            else:
-                logger.info(f"[{portal}] 0 results (not CAPTCHA, no search results)")
+            # Retry extraction once if 0 results (results may render slower
+            # under concurrent load)
+            if len(results) == 0:
+                logger.info(f"[{portal}] 0 results on first try, retrying after 2s...")
+                time.sleep(2)
+                raw_result = client.evaluate(config["extract_script"])
+                results = _parse_results(raw_result, portal)
 
-        logger.info(f"[{portal}] {len(results)} results ({elapsed:.1f}s)")
+            elapsed = time.time() - start_time
 
-        return results
+            # If still 0 results, detect CAPTCHA
+            if len(results) == 0:
+                captcha_indicators = client.evaluate(CAPTCHA_DETECT_SCRIPT)
+                if captcha_indicators and len(captcha_indicators) > 0:
+                    logger.warning(f"[{portal}] CAPTCHA detected: {captcha_indicators} - manual resolution required in browser")
+                    print(f"\n[{portal.upper()}] CAPTCHA detected! Please solve it in browser (port {port}).", file=__import__('sys').stderr)
+                else:
+                    logger.info(f"[{portal}] 0 results (not CAPTCHA, no search results)")
+
+            logger.info(f"[{portal}] {len(results)} results ({elapsed:.1f}s)")
+
+            return results
+
+        finally:
+            # Always close the tab we created, even on error
+            client.close_tab()
 
     except Exception as e:
         logger.error(f"[{portal}] Search failed: {e}")
@@ -433,7 +642,7 @@ def search_parallel(
         Search results from all portals
     """
     if portals is None:
-        portals = ["naver", "google", "brave"]
+        portals = ["google"]  # naver/brave disabled — poor results
 
     logger.info(f"[CDP] Starting parallel search: {keyword} ({portals})")
     start_time = time.time()
@@ -461,6 +670,117 @@ def search_parallel(
     return all_results
 
 
+# ========== URL Content Fetch via CDP (real Chrome) ==========
+
+# JavaScript: extract main content text, falling back to body.
+# Strategies (in order): <main>/<article>/<role=main">, then body minus nav/boilerplate.
+_FETCH_EXTRACT_SCRIPT = """
+    function pickMain() {
+        var sel = ['main', 'article', '[role="main"]', '#content', '.content',
+                   '#main-content', '.main-content', '.documentation',
+                   'div[class*="content"]', 'div[class*="Content"]'];
+        for (var i = 0; i < sel.length; i++) {
+            var el = document.querySelector(sel[i]);
+            if (el && el.innerText && el.innerText.length > 200) {
+                return el;
+            }
+        }
+        return null;
+    }
+
+    // Strip boilerplate clones from a copy of body so we keep nav out.
+    function cleanBodyText() {
+        var clone = document.body.cloneNode(true);
+        var toRemove = clone.querySelectorAll(
+            'script, style, nav, header, footer, aside, noscript, svg, iframe, form, button, .nav, .menu, .sidebar'
+        );
+        for (var i = 0; i < toRemove.length; i++) toRemove[i].remove();
+        return clone.innerText || '';
+    }
+
+    var main = pickMain();
+    var text = '';
+    if (main) {
+        // Clean inside main too (remove scripts/styles only).
+        var c = main.cloneNode(true);
+        var r = c.querySelectorAll('script, style, noscript, svg, iframe');
+        for (var j = 0; j < r.length; j++) r[j].remove();
+        text = c.innerText || '';
+    }
+    if (!text || text.length < 200) {
+        text = cleanBodyText();
+    }
+    return (text || '').substring(0, 8000);
+"""
+
+# Minimum acceptable content length (matches mcp_server MIN_CONTENT_LENGTH)
+_CDP_MIN_CONTENT = 200
+
+
+def _pick_fetch_port() -> Optional[int]:
+    """Return CDP port of first running Chrome instance (for fetching)."""
+    for portal, cfg in CHROME_INSTANCES.items():
+        if is_chrome_running(cfg["port"]):
+            return cfg["port"]
+    return None
+
+
+def fetch_url_cdp(url: str, wait_time: float = 4.0) -> dict:
+    """
+    Fetch URL content through real Chrome via CDP.
+
+    This bypasses JS-based anti-bot challenges (Cloudflare, Yandex SSO, etc.)
+    because it uses a real browser session.
+
+    Returns: {"url", "title", "content"} on success, or
+             {"url", "error": str} on failure.
+    """
+    port = _pick_fetch_port()
+    if port is None:
+        return {"url": url, "error": "No Chrome CDP instance running"}
+
+    try:
+        client = CDPClient(port)
+        if not client.create_tab():
+            return {"url": url, "error": "CDP connection failed"}
+
+        try:
+            ok = client.navigate(url, wait_time=wait_time)
+            if not ok:
+                return {"url": url, "error": "Navigate failed"}
+
+            title = client.evaluate("return document.title || '';") or ""
+            # Detect anti-bot / challenge pages still loaded
+            cur_url = client.evaluate("return window.location.href || '';") or ""
+            body_html_len = client.evaluate(
+                "return (document.body && document.body.innerHTML) "
+                "? document.body.innerHTML.length : 0;"
+            )
+
+            content = client.evaluate(_FETCH_EXTRACT_SCRIPT)
+            content = content if isinstance(content, str) else (content or "")
+
+            if not content or len(content) < _CDP_MIN_CONTENT:
+                return {
+                    "url": url,
+                    "error": "Content too short (CDP)",
+                    "title": title,
+                    "final_url": cur_url,
+                    "body_html_len": body_html_len,
+                }
+
+            return {
+                "url": url,
+                "title": title,
+                "content": content[:8000],
+            }
+        finally:
+            # Always close the tab, even on error
+            client.close_tab()
+    except Exception as e:
+        return {"url": url, "error": str(e)}
+
+
 # ========== SmartCrawl Compatible Interface ==========
 
 def search_with_cdp(
@@ -475,7 +795,7 @@ def search_with_cdp(
     """
     try:
         if portal == "all":
-            portals = ["naver", "google", "brave"]
+            portals = ["google"]  # naver/brave disabled — poor results
         else:
             portals = [portal]
 

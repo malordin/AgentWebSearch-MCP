@@ -60,7 +60,9 @@ AGENTCPM_CONFIG = {
 
 # Configuration
 SEARCH_TIMEOUT = 90.0
-FETCH_TIMEOUT = 5.0
+# Note: fetch now goes through real Chrome via CDP (navigate + page load),
+# so it needs more time than a plain HTTP request. ~15s covers most pages.
+FETCH_TIMEOUT = 15.0
 MAX_FETCH_URLS = 10
 MAX_CONTENT_LENGTH = 8000
 MIN_CONTENT_LENGTH = 200
@@ -316,9 +318,34 @@ def _simple_clean_html(html_text: str) -> tuple[str, str]:
 
 
 async def _fetch_url_content(url: str) -> dict:
-    """Fetch URL content"""
+    """
+    Fetch URL content.
+
+    Primary path: real Chrome via CDP (fetch_url_cdp). This bypasses
+    JS-based anti-bot challenges (Cloudflare/Yandex SSO/etc.) that make
+    plain HTTP clients receive short challenge pages.
+
+    Fallback: httpx direct request, used only when no Chrome CDP instance
+    is running. Many modern sites will block this path, so CDP is preferred.
+    """
     import httpx
 
+    # 1) Try real Chrome via CDP first (bypasses JS anti-bot challenges)
+    try:
+        from cdp_search import fetch_url_cdp
+        result = await asyncio.to_thread(fetch_url_cdp, url, 4.0)
+        if result and "error" not in result:
+            return result
+        # If CDP path failed with "Content too short" or other error, keep
+        # that diagnostic but still attempt httpx fallback below.
+        cdp_error = result.get("error") if result else None
+    except Exception as e:
+        cdp_error = f"CDP unavailable: {e}"
+    else:
+        if cdp_error is None:
+            cdp_error = "CDP returned nothing"
+
+    # 2) Fallback: httpx direct request (susceptible to anti-bot)
     headers = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -335,7 +362,10 @@ async def _fetch_url_content(url: str) -> dict:
             title, content = _simple_clean_html(html_text)
 
             if len(content) < MIN_CONTENT_LENGTH:
-                return {"url": url, "error": "Content too short"}
+                # Surface both the CDP error and the httpx short-content error
+                # so the user can diagnose (e.g. anti-bot challenge page).
+                return {"url": url,
+                        "error": f"Content too short (CDP: {cdp_error})"}
 
             return {
                 "url": url,
@@ -343,7 +373,7 @@ async def _fetch_url_content(url: str) -> dict:
                 "content": content[:MAX_CONTENT_LENGTH],
             }
     except Exception as e:
-        return {"url": url, "error": str(e)}
+        return {"url": url, "error": str(e), "cdp_error": cdp_error}
 
 
 async def _search_cdp(query: str, portal: str = "all") -> list[dict]:

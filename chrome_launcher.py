@@ -68,21 +68,21 @@ from pathlib import Path
 #
 
 CHROME_INSTANCES = {
-    "naver": {
-        "port": 9222,
-        "profile": "/tmp/chrome-naver-profile",
-        "start_url": "https://www.naver.com/"  # Integrated search
-    },
+    # "naver": {
+    #     "port": 9222,
+    #     "profile": "/tmp/chrome-naver-profile",
+    #     "start_url": "https://www.naver.com/"  # Integrated search
+    # },
     "google": {
         "port": 9223,
         "profile": "/tmp/chrome-google-profile",
         "start_url": "https://www.google.com"
     },
-    "brave": {
-        "port": 9224,
-        "profile": "/tmp/chrome-brave-profile",
-        "start_url": "https://search.brave.com"
-    }
+    # "brave": {
+    #     "port": 9224,
+    #     "profile": "/tmp/chrome-brave-profile",
+    #     "start_url": "https://search.brave.com"
+    # }
 }
 
 
@@ -134,12 +134,11 @@ def start_chrome(portal: str) -> bool:
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         # Detection evasion flags
-        "--disable-blink-features=AutomationControlled",
+        #"--disable-blink-features=AutomationControlled",
         "--disable-dev-shm-usage",
         "--disable-infobars",
         "--disable-extensions",
         "--disable-popup-blocking",
-        "--ignore-certificate-errors",
         start_url
     ]
 
@@ -206,7 +205,7 @@ def stop_chrome(portal: str) -> bool:
 
 def start_all() -> dict:
     """Start all Chrome instances"""
-    print("=== Starting 3 Chrome instances ===\n")
+    print(f"=== Starting {len(CHROME_INSTANCES)} Chrome instance(s) ===\n")
 
     results = {}
     for portal in CHROME_INSTANCES:
@@ -219,7 +218,7 @@ def start_all() -> dict:
 
 def stop_all() -> dict:
     """Stop all Chrome instances"""
-    print("=== Stopping 3 Chrome instances ===\n")
+    print(f"=== Stopping {len(CHROME_INSTANCES)} Chrome instance(s) ===\n")
 
     results = {}
     for portal in CHROME_INSTANCES:
