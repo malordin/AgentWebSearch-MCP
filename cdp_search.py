@@ -121,34 +121,100 @@ PORTAL_CONFIG = {
     # },
     "google": {
         "search_url": "https://www.google.com/search?q=",
-        # NOTE: Google changes its DOM frequently. The reliable pattern is
-        # <a href="..."><h3>Title</h3></a> — the link directly wraps h3.
-        # Old approach (#search .g > a) no longer works (class .g removed).
+        # Google wraps all result links through /goto?url=REDIRECT or
+        # /url?sa=t&...&url=REDIRECT tracking redirects.
+        # These redirect to the real page when opened in a browser.
+        # Structure: <a href="/goto?url=ENCODED"><h3>Title</h3></a>
+        # We accept both raw and resolved href — either works for navigation.
         "extract_script": """
             const results = [];
             const seen = new Set();
-            document.querySelectorAll('#search a, #rso a').forEach(a => {
-                const h3 = a.querySelector('h3');
-                if (!h3) return;
-                const href = a.href;
-                if (!href || href.indexOf('google.') !== -1 ||
-                    href.indexOf('gstatic') !== -1 || seen.has(href)) return;
-                seen.add(href);
-                // Walk up to parent block to find snippet text
-                let snippet = '';
-                let context = a.closest('[data-ved]') || a.parentElement;
-                if (context) {
-                    let next = context.nextElementSibling;
-                    if (next) {
-                        let span = next.querySelector('span, div');
-                        snippet = span ? (span.textContent || '').substring(0, 150) : '';
+            const searchRoot = document.querySelector('#search')
+                            || document.querySelector('#rso')
+                            || document.querySelector('[data-async-context]');
+            if (!searchRoot) return results;
+            
+            // Strategy: find h3 elements, get parent <a>, extract title + url
+            const h3s = searchRoot.querySelectorAll('h3');
+            h3s.forEach(function(h3) {
+                var a = h3.parentElement;
+                // H3 may not be direct child of A; use closest()
+                if (a && a.tagName !== 'A') a = h3.closest('a');
+                if (!a) return;
+                
+                var rawHref = a.getAttribute('href') || '';
+                if (!rawHref) return;
+                // Skip non-navigation links (gstatic, images, etc.)
+                if (rawHref.indexOf('gstatic') !== -1) return;
+                if (rawHref === '#') return;
+                
+                // Build URL: absolute or relative
+                var url;
+                if (rawHref.indexOf('http') === 0) {
+                    url = rawHref;
+                } else {
+                    url = 'https://www.google.com' + rawHref;
+                }
+                
+                if (seen.has(url)) return;
+                seen.add(url);
+                
+                // Find snippet text in parent block
+                var snippet = '';
+                var block = a.closest('[data-ved]')
+                         || a.closest('div[data-sncf]')
+                         || a.closest('.g');
+                if (!block) {
+                    // Walk up until we find a div with substantial content
+                    var p = a.parentElement;
+                    for (var i = 0; i < 4 && p; i++) {
+                        if (p.tagName === 'DIV' || p.tagName === 'SECTION') {
+                            block = p;
+                            break;
+                        }
+                        p = p.parentElement;
                     }
                 }
+                // Walk up to find a container that has BOTH the title
+                // section AND the description section (text > 2x link text).
+                // The immediate link parent only has title+URL breadcrumb;
+                // the description lives in a sibling div further up.
+                var linkLen = (a.textContent || '').length;
+                var container = null;
+                var cur = a.parentElement;
+                for (var ci = 0; ci < 7 && cur; ci++) {
+                    if ((cur.textContent || '').length > linkLen * 2 &&
+                            cur.children.length >= 2) {
+                        container = cur;
+                        break;
+                    }
+                    cur = cur.parentElement;
+                }
+                if (container) {
+                    // Clone, strip title/URL elements, take remainder as snippet
+                    var clone = container.cloneNode(true);
+                    clone.querySelectorAll(
+                        'script, style, noscript, h3, cite, a[href]'
+                    ).forEach(function(el) {
+                        if (el.parentNode) el.parentNode.removeChild(el);
+                    });
+                    var remaining = (clone.textContent || '')
+                        .replace(/[ \\t\\n\\r]+/g, ' ').trim();
+                    if (remaining.length > 30 &&
+                        remaining.indexOf(' › ') === -1 &&
+                        remaining.indexOf('https://') !== 0 &&
+                        !/^(Перейти к|К основному|Skip to)/.test(remaining)) {
+                        snippet = remaining.substring(0, 280);
+                    }
+                }
+                
                 results.push({
                     title: h3.textContent ? h3.textContent.trim() : '',
-                    url: href,
+                    url: url,
                     snippet: snippet
                 });
+                
+                if (results.length >= 10) return;
             });
             return results.slice(0, 10);
         """
@@ -403,51 +469,86 @@ class CDPClient:
             return False
 
     def _wait_for_page_settle(self, max_wait: float = 15.0,
-                             content_check: str = ""):
+                             content_check: str = "") -> bool:
         """
-        Poll page until readyState is 'complete' AND any Cloudflare/Yandex
-        challenge has resolved. If content_check JS is provided, also wait
-        until that condition returns truthy (ensures results rendered, not
-        just that the DOM finished loading).
+        Poll page until readyState is 'complete' AND any challenge has
+        resolved OR results have rendered (content_check truthy).
 
-        Args:
-            max_wait: maximum seconds to poll.
-            content_check: JS expression that returns truthy when page
-            content is ready (e.g. "document.querySelector('#search h3')").
-            None/empty disables content check (for fetch, not search).
+        Returns True if all conditions met, False if timed out or bot page.
+
+        Handles:
+        - Cloudflare / Yandex SSO: auto-resolving challenges (poll until gone)
+        - Google bot-detection ("подозрительный трафик"): manual CAPTCHA —
+          detected, logged, returns False so caller can handle it.
         """
         deadline = time.time() + max_wait
-        poll_interval = 1.0  # seconds between polls
+        poll_interval = 1.0
 
         while time.time() < deadline:
             title = self.evaluate("return document.title || '';") or ""
             ready = self.evaluate("return document.readyState || '';") or ""
-            content_ready = True  # default: satisfied if no check given
+            content_ready = True
             if content_check:
                 content_ready = bool(
                     self.evaluate(f"return !!({content_check});")
                 )
-            # Refresh ws before next poll (connection can drop)
             self._reconnect()
 
-            # Cloudflare: "Один момент…" / "Just a moment…" / "Checking your browser"
-            # Yandex SSO: "Авторизация" / "Авторизация в Яндекс"
-            challenge_titles = [
+            title_lower = title.lower()
+
+            # Auto-resolving challenges (Cloudflare, Yandex SSO)
+            auto_challenge_titles = [
                 "один момент", "just a moment", "checking your browser",
                 "cloudflare", "авторизац", "проверка безопасности",
             ]
-            is_challenge = any(t in title.lower() for t in challenge_titles)
+            is_auto_challenge = any(
+                t in title_lower for t in auto_challenge_titles
+            )
+
+            # Google bot-detection: body text check
+            body_sample = (
+                " "
+                + (self.evaluate(
+                    "return (document.body && "
+                    "document.body.innerText || '').substring(0, 800);"
+                ) or "").lower()
+            )
+            is_bot_page = (
+                "подозрительный трафик" in body_sample
+                or "suspicious traffic" in body_sample
+                or "зарегистрировали подозрител" in body_sample
+                or "не робот" in body_sample
+                or "are you a robot" in body_sample
+                or "verify you are human" in body_sample
+            )
+
+            is_challenge = is_auto_challenge or is_bot_page
+
+            if is_bot_page and not is_auto_challenge:
+                logger.warning(
+                    f"[CDP:{self.port}] Google bot-detection page found "
+                    f"(manual CAPTCHA needed). Body: {body_sample[:120]}"
+                )
+                return False  # let caller handle manual wait
 
             if ready == "complete" and not is_challenge and content_ready:
-                # Page loaded, not a challenge, content rendered — done
-                return
+                return True  # all good
 
-            if is_challenge:
-                logger.info(f"[CDP:{self.port}] Challenge page detected "
-                            f"(title='{title}'), waiting for resolution...")
-            # else: page still loading or content not rendered, keep waiting
+            if is_auto_challenge:
+                logger.info(
+                    f"[CDP:{self.port}] Challenge page detected "
+                    f"(title='{title}'), waiting for resolution..."
+                )
 
             time.sleep(poll_interval)
+
+        # Timeout reached without all conditions met
+        title_at_timeout = self.evaluate("return document.title || '';") or "?"
+        logger.warning(
+            f"[CDP:{self.port}] Page settle timed out after {max_wait}s "
+            f"(title='{title_at_timeout}')"
+        )
+        return False
 
     def evaluate(self, script: str) -> any:
         """Execute JavaScript on OUR tab (never a random tab)."""
@@ -525,11 +626,123 @@ def _cleanup_stale_tabs(port: int):
         pass  # Best-effort cleanup
 
 
+# ========== Captcha Detection & Wait ==========
+
+_MAX_CAPTCHA_WAIT = 180   # seconds for user to manually solve
+_CAPTCHA_POLL_INTERVAL = 3  # seconds between checks
+
+
+def _is_on_captcha_page(client: "CDPClient") -> bool:
+    """
+    Detect Google bot-detection / CAPTCHA page by inspecting body text.
+    """
+    try:
+        body = (client.evaluate(
+            "return (document.body && document.body.innerText || '');"
+        ) or "").lower()
+        title = (client.evaluate(
+            "return document.title || '';"
+        ) or "").lower()
+        patterns = [
+            "подозрительный трафик", "suspicious traffic",
+            "зарегистрировали подозрител", "не робот",
+            "are you a robot", "verify you are human",
+            "security check", "captcha",
+        ]
+        is_bot_body = any(p in body for p in patterns)
+        is_bot_title = title.startswith("https://") or title.startswith("http://")
+        return is_bot_body and len(body) < 2000
+    except Exception:
+        return False
+
+
+def _wait_for_captcha_resolution(
+    client: "CDPClient",
+    portal: str,
+    port: int,
+    start_time: float,
+) -> None:
+    """
+    Poll until user manually solves the CAPTCHA and results appear.
+    Prints status to stderr for visibility in MCP server output.
+    """
+    import sys
+    deadline = time.time() + _MAX_CAPTCHA_WAIT
+    last_log = time.time()
+    log_interval = 10  # seconds between status lines
+
+    msg = (
+        f"\n[{portal.upper()}] CAPTCHA/bot-detection page detected.\n"
+        f"[{portal.upper()}] Solve it in Chrome (port {port}), "
+        f"waiting up to {_MAX_CAPTCHA_WAIT}s...\n"
+    )
+    print(msg, file=sys.stderr, flush=True)
+    logger.warning(
+        f"[{portal}] Manual CAPTCHA detected on port {port}"
+    )
+
+    while time.time() < deadline:
+        time.sleep(_CAPTCHA_POLL_INTERVAL)
+        client._reconnect()
+
+        # Check: is captcha page gone?
+        still_captcha = _is_on_captcha_page(client)
+
+        if not still_captcha:
+            # Captcha resolved, check for search results
+            h3_count = client.evaluate(
+                "return document.querySelectorAll("
+                "'#search h3, #rso h3').length;"
+            ) or 0
+            if h3_count > 0:
+                elapsed = time.time() - start_time
+                print(
+                    f"[{portal.upper()}] CAPTCHA resolved, "
+                    f"results found after {elapsed:.0f}s\n",
+                    file=sys.stderr, flush=True,
+                )
+                logger.info(
+                    f"[{portal}] Captcha resolved ({elapsed:.0f}s), "
+                    f"{h3_count} h3 elements found"
+                )
+                return
+
+        # Still waiting: status update
+        now = time.time()
+        if now - last_log >= log_interval:
+            elapsed = now - start_time
+            print(
+                f"[{portal.upper()}] Still waiting... "
+                f"({elapsed:.0f}s elapsed)\n",
+                file=sys.stderr, flush=True,
+            )
+            last_log = now
+
+    # Timeout reached
+    elapsed = time.time() - start_time
+    logger.warning(
+        f"[{portal}] Captcha wait timed out after {elapsed:.0f}s"
+    )
+    print(
+        f"[{portal.upper()}] CAPTCHA wait timed out after "
+        f"{elapsed:.0f}s\n",
+        file=sys.stderr, flush=True,
+    )
+
+
 # ========== Search Functions ==========
 
 def _search_portal(portal: str, keyword: str) -> list[SearchResult]:
     """
-    Single portal search (uses independent Chrome instance)
+    Single portal search (uses independent Chrome instance).
+
+    Flow:
+    1. Navigate to search URL, wait for page to settle.
+    2. Extract results.
+    3. If 0 results AND captcha page detected:
+       → Print "solve captcha" to stderr.
+       → Poll every 3s until captcha resolves OR h3 appears (120s timeout).
+       → Re-extract and return results.
     """
     config = PORTAL_CONFIG.get(portal)
     chrome_config = CHROME_INSTANCES.get(portal)
@@ -539,7 +752,6 @@ def _search_portal(portal: str, keyword: str) -> list[SearchResult]:
 
     port = chrome_config["port"]
 
-    # Check if Chrome is running
     if not is_chrome_running(port):
         logger.warning(f"[{portal}] Chrome not running, attempting to start...")
         if not start_chrome(portal):
@@ -550,50 +762,85 @@ def _search_portal(portal: str, keyword: str) -> list[SearchResult]:
     try:
         start_time = time.time()
 
-        # CDP client — create a NEW isolated tab for this search
         client = CDPClient(port)
         if not client.create_tab():
             return []
 
         try:
-            # Navigate to search URL
             import urllib.parse
             search_url = config["search_url"] + urllib.parse.quote(keyword)
 
-            # Content check: wait for search results to actually render.
-            # Google: wait for at least one h3 inside #search (results container).
             content_check = ""
             if portal == "google":
                 content_check = "document.querySelector('#search h3, #rso h3')"
             client.navigate(search_url, wait_time=3.5,
-                            max_extra_wait=20.0,
+                            max_extra_wait=40.0,
                             content_check=content_check)
+            client._reconnect()
 
-            # Extract results
+            # --- Extraction ---
             raw_result = client.evaluate(config["extract_script"])
             results = _parse_results(raw_result, portal)
 
-            # Retry extraction once if 0 results (results may render slower
-            # under concurrent load)
             if len(results) == 0:
-                logger.info(f"[{portal}] 0 results on first try, retrying after 2s...")
-                time.sleep(2)
-                raw_result = client.evaluate(config["extract_script"])
-                results = _parse_results(raw_result, portal)
+                # Diagnostic: log page state to help debug future failures
+                _dbg_title = client.evaluate("return document.title || '';") or "?"
+                _dbg_url = client.evaluate("return window.location.href || '';") or "?"
+                logger.warning(
+                    f"[{portal}] 0 results after navigation. "
+                    f"title='{_dbg_title}', url='{_dbg_url[:80]}'"
+                )
+
+                # Check if we landed on a captcha page first
+                is_captcha = _is_on_captcha_page(client)
+
+                if is_captcha:
+                    # Manual CAPTCHA: wait for user to solve it
+                    _wait_for_captcha_resolution(
+                        client, portal, port, start_time
+                    )
+                    raw_result = client.evaluate(config["extract_script"])
+                    results = _parse_results(raw_result, portal)
+                else:
+                    # Not captcha — page may still be rendering.
+                    # Poll up to 15s more in 3s increments (5 attempts).
+                    logger.info(
+                        f"[{portal}] 0 results (not captcha), "
+                        f"polling for slow render up to 15s..."
+                    )
+                    for attempt in range(1, 6):
+                        time.sleep(3)
+                        client._reconnect()
+                        if portal == "google":
+                            h3_count = client.evaluate(
+                                "return document.querySelectorAll("
+                                "'#search h3, #rso h3').length;"
+                            ) or 0
+                            logger.info(
+                                f"[{portal}] Retry {attempt}/5: "
+                                f"{h3_count} h3 elements found"
+                            )
+                            if h3_count == 0:
+                                continue
+                        raw_result = client.evaluate(config["extract_script"])
+                        results = _parse_results(raw_result, portal)
+                        if results:
+                            logger.info(
+                                f"[{portal}] Got {len(results)} results "
+                                f"on retry {attempt}/5"
+                            )
+                            break
+
+                    # Final captcha check after retry exhaustion
+                    if len(results) == 0 and _is_on_captcha_page(client):
+                        _wait_for_captcha_resolution(
+                            client, portal, port, start_time
+                        )
+                        raw_result = client.evaluate(config["extract_script"])
+                        results = _parse_results(raw_result, portal)
 
             elapsed = time.time() - start_time
-
-            # If still 0 results, detect CAPTCHA
-            if len(results) == 0:
-                captcha_indicators = client.evaluate(CAPTCHA_DETECT_SCRIPT)
-                if captcha_indicators and len(captcha_indicators) > 0:
-                    logger.warning(f"[{portal}] CAPTCHA detected: {captcha_indicators} - manual resolution required in browser")
-                    print(f"\n[{portal.upper()}] CAPTCHA detected! Please solve it in browser (port {port}).", file=__import__('sys').stderr)
-                else:
-                    logger.info(f"[{portal}] 0 results (not CAPTCHA, no search results)")
-
             logger.info(f"[{portal}] {len(results)} results ({elapsed:.1f}s)")
-
             return results
 
         finally:

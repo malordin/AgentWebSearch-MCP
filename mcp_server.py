@@ -262,6 +262,35 @@ def _is_low_quality(url: str) -> bool:
     return False
 
 
+def _clean_snippet(text: str, max_len: int = 250) -> str:
+    """Normalize snippet text for clean LLM consumption."""
+    if not text:
+        return ""
+    text = text.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Strip "Site name · [date —] description" prefix (Google breadcrumb leak)
+    m = re.match(r'^[^.!?]{1,60} · ', text)
+    if m:
+        text = text[m.end():]
+        # Also strip trailing date/pub-date: "20 окт. 2025 г. — text"
+        text = re.sub(r'^\d{1,2} \S{2,6}\.? \d{4}[^——]*[——] ?', '', text)
+    # Strip bare domain prefix stuck to content: "example.comSome text..."
+    text = re.sub(r'^[a-zA-Z0-9\-]+\.[a-zA-Z]{2,6}', '', text).strip()
+    # Strip site name concatenated directly to content: "Stack OverflowSo..."
+    # Detects: multi-word PascalCase prefix immediately before next word
+    m2 = re.match(r'^([A-Z][a-zA-Z]*(?: [A-Z][a-zA-Z]*)*)(?=[A-Z][a-z])', text)
+    if m2 and ' ' in m2.group(0) and len(m2.group(0)) < 40:
+        text = text[m2.end():]
+    # Drop obvious boilerplate
+    boilerplate = (
+        "перейти к основному", "к основному содержимому",
+        "skip to main", "javascript is disabled",
+    )
+    if any(text.lower().startswith(b) for b in boilerplate):
+        return ""
+    return text[:max_len]
+
+
 def _dedup_urls(urls: list[str]) -> list[str]:
     """Deduplicate URLs"""
     seen = set()
@@ -570,11 +599,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=f"No results for '{query}'")]
 
         # Format results
-        output = [f"## Search Results for '{query}'\n"]
+        portals_used = sorted({r['source'] for r in results})
+        output = [
+            f"## Web Search: \"{query}\"",
+            f"*{len(results)} results • {', '.join(portals_used)}*\n",
+        ]
         for i, r in enumerate(results[:count], 1):
+            snippet = _clean_snippet(r.get('snippet', ''))
             output.append(f"{i}. **{r['title']}**")
-            output.append(f"   URL: {r['url']}")
-            output.append(f"   ({r['source']}) {r['snippet']}\n")
+            output.append(f"   <{r['url']}>")
+            if snippet:
+                output.append(f"   {snippet}")
+            output.append("")
 
         return [TextContent(type="text", text="\n".join(output))]
 
@@ -649,12 +685,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Store search results
         await _search_state.add_search_results(results)
 
-        output = [f"## Smart Search: '{query}' (depth={depth}) [id: {search_id}]\n"]
-        output.append("### Search Results\n")
+        portals_used = sorted({r['source'] for r in results})
+        output = [
+            f"## Smart Search: \"{query}\" (depth={depth}) [id: {search_id}]",
+            f"*{len(results)} results • {', '.join(portals_used)}*\n",
+            "### Search Results\n",
+        ]
         for i, r in enumerate(results[:10], 1):
+            snippet = _clean_snippet(r.get('snippet', ''))
             output.append(f"{i}. **{r['title']}**")
-            output.append(f"   URL: {r['url']}")
-            output.append(f"   ({r['source']}) {r['snippet']}\n")
+            output.append(f"   <{r['url']}>")
+            if snippet:
+                output.append(f"   {snippet}")
+            output.append("")
 
         # 2. Fetch URL content based on depth
         if depth_cfg["fetch_enabled"] and max_fetch > 0:
